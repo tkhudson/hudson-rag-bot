@@ -1,0 +1,10 @@
+langchain-huggingface
+sentence-transformers
+langchain-community
+langchain-text-splitters
+langchain-ollama
+langchain-chroma
+langchain-core
+gradio
+pdfminer.six
+pillow-heif

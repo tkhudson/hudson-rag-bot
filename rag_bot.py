@@ -4,9 +4,10 @@
 import os
 import shutil
 from pathlib import Path
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader, UnstructuredPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_ollama import OllamaEmbeddings, ChatOllama
+from langchain_ollama import ChatOllama
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
@@ -23,20 +24,20 @@ DOCS_FOLDER.mkdir(exist_ok=True)
 LLM_MODEL = "phi3:14b"
 EMBEDDING_MODEL = "nomic-embed-text"
 
-embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-llm = ChatOllama(model=LLM_MODEL, temperature=0.1, num_ctx=8192)
+embeddings = HuggingFaceEmbeddings(model_name="nomic-ai/nomic-embed-text-v1.5", model_kwargs={"trust_remote_code": True})
+llm = ChatOllama(model=LLM_MODEL, temperature=0.1, num_ctx=8192, base_url="http://127.0.0.1:11434")
 
 # Global DB — will be recreated fresh every time
 db = None
 
-# Global examples — will be updated based on uploaded files
-examples = ["Summarize the document", "What are the main points?", "List key skills", "Contact information"]
-
 def create_fresh_db_and_index(chunks):
     """Creates a brand-new Chroma DB and indexes chunks — 100% safe"""
     global db
-    # Nuke the old DB completely
+    # Nuke the old DB completely, fixing readonly permissions first
     if CHROMA_PATH.exists():
+        for root, dirs, files in os.walk(CHROMA_PATH):
+            for file in files:
+                os.chmod(os.path.join(root, file), 0o644)
         shutil.rmtree(CHROMA_PATH, ignore_errors=True)
     CHROMA_PATH.mkdir(exist_ok=True)
 
@@ -56,14 +57,23 @@ def load_documents():
         try:
             if p.suffix.lower() == ".pdf":
                 loader = PyPDFLoader(str(p))
+                loaded = loader.load()
+                valid = [d for d in loaded if d.page_content.strip()]
+                if not valid:
+                    # Fallback to Unstructured for scanned PDFs
+                    loader = UnstructuredPDFLoader(str(p))
+                    loaded = loader.load()
+                    valid = [d for d in loaded if d.page_content.strip()]
             elif p.suffix.lower() == ".docx":
                 loader = Docx2txtLoader(str(p))
+                loaded = loader.load()
+                valid = [d for d in loaded if d.page_content.strip()]
             elif p.suffix.lower() in {".txt", ".md"}:
                 loader = TextLoader(str(p), encoding="utf-8")
+                loaded = loader.load()
+                valid = [d for d in loaded if d.page_content.strip()]
             else:
                 continue
-            loaded = loader.load()
-            valid = [d for d in loaded if d.page_content.strip()]
             for d in valid:
                 d.metadata["source"] = p.name
             docs.extend(valid)
@@ -74,7 +84,7 @@ def load_documents():
 
 # ====================== INDEX ======================
 def index_documents(files):
-    global db, examples
+    global db
 
     # Copy uploaded files
     for f in files or []:
@@ -84,46 +94,29 @@ def index_documents(files):
 
     docs = load_documents()
     if not docs:
-        examples = ["Summarize the document", "What are the main points?", "List key skills", "Contact information"]
-        examples_md = "### Suggested Questions\n" + "\n".join(f"- {e}" for e in examples)
-        return "No readable text found in files.", examples_md
+        return "No readable text found in files."
 
-    # Update examples based on the most recently uploaded file
-    if files:
-        last_file = Path(files[-1].name).name.lower()
-        if 'cover' in last_file or 'letter' in last_file:
-            examples = ["Summarize the document", "What are the main points?", "List key skills", "Contact information"]
-        elif 'army' in last_file or 'survival' in last_file:
-            examples = ["What are the key survival tips?", "How to build a shelter?", "Water purification methods", "First aid basics"]
-        else:
-            examples = ["Summarize the document", "What are the main points?", "Key information", "Details"]
-    else:
-        examples = ["Summarize the document", "What are the main points?", "List key skills", "Contact information"]
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=600)
     chunks = [c for c in splitter.split_documents(docs) if c.page_content.strip()]
     if not chunks:
-        examples_md = "### Suggested Questions\n" + "\n".join(f"- {e}" for e in examples)
-        return "No text chunks — maybe scanned PDF?", examples_md
+        return "No text chunks — maybe scanned PDF?"
 
     # THIS IS THE ONLY LINE THAT MATTERS
     create_fresh_db_and_index(chunks)
 
-    examples_md = "### Suggested Questions\n" + "\n".join(f"- {e}" for e in examples)
-    return f"Indexed {len(chunks)} chunks from {len(docs)} pages. Ready!", examples_md
+    return f"Indexed {len(chunks)} chunks from {len(docs)} pages. Ready!"
+
 
 # ====================== CLEAR ======================
 def clear_all():
-    global db, examples
+    global db
     for p in list(DOCS_FOLDER.iterdir()):
         if p.is_file(): p.unlink()
     if CHROMA_PATH.exists():
         shutil.rmtree(CHROMA_PATH, ignore_errors=True)
     CHROMA_PATH.mkdir()
     db = None
-    examples = ["Summarize the document", "What are the main points?", "List key skills", "Contact information"]
-    examples_md = "### Suggested Questions\n" + "\n".join(f"- {e}" for e in examples)
-    return "Everything cleared.", examples_md
+    return "Everything cleared."
 
 # ====================== RAG ======================
 prompt = ChatPromptTemplate.from_messages([
@@ -143,38 +136,51 @@ def ask_question(message: str, history):
     return chain.invoke(message)
 
 # ====================== UI ======================
-theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="slate")
+theme = gr.themes.Soft(primary_hue="blue", secondary_hue="gray")
 
-with gr.Blocks(title="Private RAG Knowledge Base") as demo:
-    gr.Markdown("# 🔒 Private RAG Knowledge Base\n**100% Local • Phi3:14B • Nomic Embeddings**\n\nUpload documents and ask questions about them.")
+def ask_question_with_history(message, history):
+    if not message.strip():
+        return "", history
+    if db is None or db._collection.count() == 0:
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": "No documents indexed yet!"})
+        return "", history
+    try:
+        retriever = db.as_retriever(search_type="mmr", search_kwargs={"k": 8})
+        chain = ({"context": retriever | format_docs, "question": RunnablePassthrough()}
+                 | prompt | llm | StrOutputParser())
+        response = chain.invoke(message)
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": response})
+        return "", history
+    except Exception as e:
+        error_msg = f"Error generating response: {str(e)}"
+        print(error_msg)
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": error_msg})
+        return "", history
 
-    with gr.Tabs():
-        with gr.TabItem("📁 Documents"):
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### Upload Files")
-                    files = gr.File(label="Supported formats: PDF, DOCX, TXT, MD", file_count="multiple", type="filepath")
-                    with gr.Row():
-                        index_btn = gr.Button("🔍 Index Documents", variant="primary", size="lg")
-                        clear_btn = gr.Button("🗑️ Clear All", variant="secondary", size="lg")
-                    status = gr.Textbox(label="Status", lines=5)
+with gr.Blocks(title="Private RAG • Phi3:14B") as demo:
+    gr.Markdown("# Private RAG • 100% Local • Phi3:14B")
 
-        with gr.TabItem("💬 Chat"):
-            gr.Markdown("### Ask Questions")
-            examples_md = gr.Markdown("### Suggested Questions\n- Summarize the document\n- What are the main points?\n- List key skills\n- Contact information")
-            gr.ChatInterface(
-                fn=ask_question,
-                examples=[
-                    "Summarize the document",
-                    "What are the main points?",
-                    "List key skills",
-                    "Contact information"
-                ]
-            )
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### Upload & Index")
+            files = gr.File(label="PDF • DOCX • TXT", file_count="multiple", type="filepath")
+            index_btn = gr.Button("Index Documents", variant="primary", size="lg")
+            clear_btn = gr.Button("Clear All", variant="stop", size="lg")
+            status = gr.Textbox(label="Status", lines=5)
 
-    index_btn.click(fn=index_documents, inputs=files, outputs=[status, examples_md])
-    clear_btn.click(fn=clear_all, inputs=None, outputs=[status, examples_md])
+        with gr.Column(scale=2):
+            gr.Markdown("### Ask Anything")
+            chatbot = gr.Chatbot()
+            textbox = gr.Textbox(placeholder="Ask a question...", show_label=False)
+            btn = gr.Button("Send", variant="primary")
+
+    btn.click(fn=ask_question_with_history, inputs=[textbox, chatbot], outputs=[textbox, chatbot])
+    index_btn.click(fn=index_documents, inputs=files, outputs=status)
+    clear_btn.click(fn=clear_all, inputs=None, outputs=status)
 
 if __name__ == "__main__":
     print("Starting Private RAG Bot…")
-    demo.launch(theme=theme, share=True, server_port=7863)
+    demo.launch(theme=theme, server_port=7863)
