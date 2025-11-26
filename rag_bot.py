@@ -29,6 +29,9 @@ llm = ChatOllama(model=LLM_MODEL, temperature=0.1, num_ctx=8192)
 # Global DB — will be recreated fresh every time
 db = None
 
+# Global examples — will be updated based on uploaded files
+examples = ["Summarize the document", "What are the main points?", "List key skills", "Contact information"]
+
 def create_fresh_db_and_index(chunks):
     """Creates a brand-new Chroma DB and indexes chunks — 100% safe"""
     global db
@@ -71,8 +74,8 @@ def load_documents():
 
 # ====================== INDEX ======================
 def index_documents(files):
-    global db
-    
+    global db, examples
+
     # Copy uploaded files
     for f in files or []:
         dest = DOCS_FOLDER / Path(f.name).name
@@ -81,28 +84,46 @@ def index_documents(files):
 
     docs = load_documents()
     if not docs:
-        return "No readable text found in files."
+        examples = ["Summarize the document", "What are the main points?", "List key skills", "Contact information"]
+        examples_md = "### Suggested Questions\n" + "\n".join(f"- {e}" for e in examples)
+        return "No readable text found in files.", examples_md
+
+    # Update examples based on the most recently uploaded file
+    if files:
+        last_file = Path(files[-1].name).name.lower()
+        if 'cover' in last_file or 'letter' in last_file:
+            examples = ["Summarize the document", "What are the main points?", "List key skills", "Contact information"]
+        elif 'army' in last_file or 'survival' in last_file:
+            examples = ["What are the key survival tips?", "How to build a shelter?", "Water purification methods", "First aid basics"]
+        else:
+            examples = ["Summarize the document", "What are the main points?", "Key information", "Details"]
+    else:
+        examples = ["Summarize the document", "What are the main points?", "List key skills", "Contact information"]
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
     chunks = [c for c in splitter.split_documents(docs) if c.page_content.strip()]
     if not chunks:
-        return "No text chunks — maybe scanned PDF?"
+        examples_md = "### Suggested Questions\n" + "\n".join(f"- {e}" for e in examples)
+        return "No text chunks — maybe scanned PDF?", examples_md
 
     # THIS IS THE ONLY LINE THAT MATTERS
     create_fresh_db_and_index(chunks)
 
-    return f"Indexed {len(chunks)} chunks from {len(docs)} pages. Ready!"
+    examples_md = "### Suggested Questions\n" + "\n".join(f"- {e}" for e in examples)
+    return f"Indexed {len(chunks)} chunks from {len(docs)} pages. Ready!", examples_md
 
 # ====================== CLEAR ======================
 def clear_all():
-    global db
+    global db, examples
     for p in list(DOCS_FOLDER.iterdir()):
         if p.is_file(): p.unlink()
     if CHROMA_PATH.exists():
         shutil.rmtree(CHROMA_PATH, ignore_errors=True)
     CHROMA_PATH.mkdir()
     db = None
-    return "Everything cleared."
+    examples = ["Summarize the document", "What are the main points?", "List key skills", "Contact information"]
+    examples_md = "### Suggested Questions\n" + "\n".join(f"- {e}" for e in examples)
+    return "Everything cleared.", examples_md
 
 # ====================== RAG ======================
 prompt = ChatPromptTemplate.from_messages([
@@ -140,6 +161,7 @@ with gr.Blocks(title="Private RAG Knowledge Base") as demo:
 
         with gr.TabItem("💬 Chat"):
             gr.Markdown("### Ask Questions")
+            examples_md = gr.Markdown("### Suggested Questions\n- Summarize the document\n- What are the main points?\n- List key skills\n- Contact information")
             gr.ChatInterface(
                 fn=ask_question,
                 examples=[
@@ -150,8 +172,8 @@ with gr.Blocks(title="Private RAG Knowledge Base") as demo:
                 ]
             )
 
-    index_btn.click(fn=index_documents, inputs=files, outputs=status)
-    clear_btn.click(fn=clear_all, inputs=None, outputs=status)
+    index_btn.click(fn=index_documents, inputs=files, outputs=[status, examples_md])
+    clear_btn.click(fn=clear_all, inputs=None, outputs=[status, examples_md])
 
 if __name__ == "__main__":
     print("Starting Private RAG Bot…")
